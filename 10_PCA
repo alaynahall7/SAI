@@ -1,0 +1,1628 @@
+import numpy as np
+import pandas as pd
+import xarray as xr
+import hvplot.xarray
+import hvplot.pandas
+import matplotlib.pyplot as plt
+import matplotlib.path as mpath
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from neuralprophet import NeuralProphet, set_log_level
+import cdsapi
+import cartopy.crs as ccrs
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+import cartopy.feature as cfeature
+import urllib3 
+urllib3.disable_warnings()
+from pathlib import Path 
+from matplotlib.animation import FuncAnimation
+import cartopy.feature as cf
+from cartopy.feature import NaturalEarthFeature
+from scipy.integrate import ode
+from IPython.display import HTML
+from tempfile import NamedTemporaryFile
+from matplotlib import animation
+import seaborn as sns
+
+
+
+#region Data setup
+
+#import the data
+
+clm_temp = pd.read_csv('/Users/rachelalaynahall/Desktop/Desktop - Joshua’s MacBook Air/NP/.conda/tavg3_3d_asm_Nv_daily_48x24.csv')
+clm_aod = pd.read_csv('/Users/rachelalaynahall/Desktop/Desktop - Joshua’s MacBook Air/NP/.conda/TOTEXTTAU_daily_48x24.csv')
+
+#change to datetime
+
+clm_temp['date'] = pd.to_datetime(clm_temp['date'])
+clm_aod['date'] = pd.to_datetime(clm_aod['date'])
+
+#rename columns (date to time, and TOTEXTTAU to A)
+
+clm_temp.rename(columns = {'date':'time'}, inplace = True)
+clm_aod.rename(columns = {'date':'time'}, inplace = True)
+clm_aod.rename(columns = {'TOTEXTTAU':'A'}, inplace = True)
+
+#remove extra observations from AOD data
+
+enddate = pd.datetime(1998,12,10)
+clm_aod = clm_aod[clm_aod['time'] <= enddate]
+
+#subtract mean (climatology) for each month from 01/01/1986 through 12/31/1990
+
+dt = clm_temp.set_index(["time", "lat", "lon"]).to_xarray()
+ct_period = dt.sel(time = slice('1986-01-01', '1990-12-31'))
+ct_month = ct_period.groupby('time.month').mean()
+at_month = dt.groupby('time.month') - ct_month
+
+da = clm_aod.set_index(["time", "lat", "lon"]).to_xarray()
+ca_period = da.sel(time = slice('1986-01-01', '1990-12-31'))
+ca_month = ca_period.groupby('time.month').mean()
+aa_month = da.groupby('time.month') - ca_month
+
+#convert xarrays to dataframes
+
+ct = at_month.to_dataframe()
+ca = aa_month.to_dataframe()
+
+#export dataframes
+
+filepath = Path('/Users/rachelalaynahall/Desktop/Desktop - Joshua’s MacBook Air/NP/.conda/ct.csv')  
+filepath.parent.mkdir(parents=True, exist_ok=True)  
+ct.to_csv(filepath)
+ 
+filepath2 = Path('/Users/rachelalaynahall/Desktop/Desktop - Joshua’s MacBook Air/NP/.conda/ca.csv')  
+filepath2.parent.mkdir(parents=True, exist_ok=True)  
+ca.to_csv(filepath2)
+
+#re-upload files to make df easier to manage
+
+ct = pd.read_csv('/Users/rachelalaynahall/Desktop/Desktop - Joshua’s MacBook Air/NP/.conda/ct.csv')
+ca = pd.read_csv('/Users/rachelalaynahall/Desktop/Desktop - Joshua’s MacBook Air/NP/.conda/ca.csv')
+
+ca.rename(columns = {'TOTEXTTAU':'A'}, inplace = True)
+
+#make latitude and longitude non-negative by adding 90 to lat, and 180 to lon
+
+ct["lat"] = ct["lat"] + 90
+ct["lon"] = ct["lon"] + 180
+
+ca["lat"] = ca["lat"] + 90
+ca["lon"] = ca["lon"] + 180
+
+#make location string with separator ".."
+
+ct["location"] = ct["lat"].astype(str) + ".." + ct["lon"].astype(str)
+ca["location"] = ca["lat"].astype(str) + ".." + ca["lon"].astype(str)
+
+#set index as time
+
+ct = ct.sort_values(by = ['location', 'time'], ascending = [True, True])
+ca = ca.sort_values(by = ['location', 'time'], ascending = [True, True])
+
+ct = ct.set_index('time')
+ca = ca.set_index('time')
+
+#remove lat, lon, and month variables
+
+ct = ct.drop(['lat', 'lon', 'month'], axis = 1)
+ca = ca.drop(['lat', 'lon', 'month'], axis = 1)
+
+#export to R for data processing
+  
+filepath3 = Path('/Users/rachelalaynahall/Desktop/ct10.csv')  
+filepath3.parent.mkdir(parents=True, exist_ok=True)  
+ct.to_csv(filepath3)
+
+filepath4 = Path('/Users/rachelalaynahall/Desktop/ca10.csv')  
+filepath4.parent.mkdir(parents=True, exist_ok=True)  
+ca.to_csv(filepath4)
+
+#endregion
+
+### R CODE BLOCK ###
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggplot2)
+library(tidyverse)
+library(readxl)
+library(rgdal) 
+library(lattice) 
+library(dplyr) 
+library(tmap)
+library(tmaptools)
+library(readxl)
+library(knitr)
+library(reshape2)
+library(ggplot2)
+library(viridis)
+library(terra)
+library(scales)
+library(tidyr)
+library(forecast)
+library(astsa)
+library(lubridate)
+library(marima)
+library(climatrends)
+
+```
+
+
+
+```{r}
+
+ct10 = read.csv("~/Desktop/ct10.csv")
+ca10 = read.csv("~/Desktop/ca10.csv")
+
+
+split_ct10 = data.frame(split(ct10, ct10$location))
+split_ca10 = data.frame(split(ca10, ca10$location))
+
+```
+
+
+```{r}
+rownames(split_ct10)<-unlist(split_ct10[,1])
+rownames(split_ca10)<-unlist(split_ca10[,1])
+
+```
+
+
+```{r}
+split_ct10 = split_ct10 %>% select(-contains(".location"))
+split_ct10 = split_ct10 %>% select(-contains(".time"))
+
+split_ca10 = split_ca10 %>% select(-contains(".location"))
+split_ca10 = split_ca10 %>% select(-contains(".time"))
+```
+
+
+```{r}
+
+colnames(split_ca10) <- gsub('.A','',colnames(split_ca10))
+colnames(split_ct10) <- gsub('.T','',colnames(split_ct10))
+
+```
+
+
+```{r}
+
+write.csv(split_ca10, "~/Desktop/splitca10.csv", row.names = TRUE)
+write.csv(split_ct10, "~/Desktop/splitct10.csv", row.names = TRUE)
+
+
+```
+
+### END R CODE BLOCK ###
+
+
+#region PCA
+
+#import the data from R
+
+clm_t = pd.read_csv('/Users/rachelalaynahall/Desktop/splitct10.csv')
+clm_a = pd.read_csv('/Users/rachelalaynahall/Desktop/splitca10.csv')
+
+#add name to date column
+
+clm_t.rename( columns={'Unnamed: 0':'Date'}, inplace=True )
+clm_a.rename( columns={'Unnamed: 0':'Date'}, inplace=True )
+
+#convert to df
+
+clm_t = pd.DataFrame(clm_t)
+clm_a = pd.DataFrame(clm_a)
+
+#remove ".X" from column headings
+
+clm_t.columns = clm_t.columns.str.strip('X.')
+clm_a.columns = clm_a.columns.str.strip('X.')
+
+#convert date to datetime
+
+clm_t['Date'] = pd.to_datetime(clm_t['Date'])
+clm_a['Date'] = pd.to_datetime(clm_a['Date'])
+
+#set date as index
+
+clm_t = clm_t.set_index('Date')
+clm_a = clm_a.set_index('Date')
+
+#create features list
+
+loc_list = list(clm_t)
+features = loc_list
+
+x_ct = clm_t.loc[:, features].values
+x_ca = clm_a.loc[:, features].values
+
+#create scaler functions
+
+scaler_ct = StandardScaler()
+scaler_ca = StandardScaler()
+
+#fit scalers on data
+
+scaler_ct.fit(x_ct)
+scaler_ca.fit(x_ca)
+
+#scale data
+
+x_ct = scaler_ct.transform(x_ct)
+x_ca = scaler_ca.transform(x_ca)
+
+#create pca function
+
+pca = PCA(n_components = 10)
+
+#fit pca functions on temperature data
+
+pca.fit(x_ct)
+
+#transform data through pca
+
+principalComponents_ct = pca.transform(x_ct)
+principalComponents_ca = pca.transform(x_ca)
+
+#create new dfs with principal components
+
+principalDf_ct = pd.DataFrame(data = principalComponents_ct
+             , columns = ['principal component 1 - Temp', 'principal component 2 - Temp', 'principal component 3 - Temp', 'principal component 4 - Temp','principal component 5 - Temp', 'principal component 6 - Temp', 'principal component 7 - Temp', 'principal component 8 - Temp', 'principal component 9 - Temp','principal component 10 - Temp'])
+
+principalDf_ca = pd.DataFrame(data = principalComponents_ca
+             , columns = ['principal component 1 - AOD', 'principal component 2 - AOD', 'principal component 3 - AOD', 'principal component 4 - AOD','principal component 5 - AOD', 'principal component 6 - AOD', 'principal component 7 - AOD', 'principal component 8 - AOD', 'principal component 9 - AOD','principal component 10 - AOD'])
+
+#add back in date column
+
+principalDf_ct['date'] = pd.date_range(start='1/1/1986', periods = len(principalDf_ct), freq='D')
+principalDf_ca['date'] = pd.date_range(start='1/1/1986', periods = len(principalDf_ca), freq='D')
+
+#view explained variance
+
+pca.explained_variance_ratio_
+
+#view dfs
+
+principalDf_ct
+principalDf_ca
+
+#separate train and test data
+
+principalDf_ct['date'] = pd.to_datetime(principalDf_ct['date'])
+principalDf_ca['date'] = pd.to_datetime(principalDf_ca['date'])
+
+split_date = pd.datetime(1990,12,31)
+
+ct_train = principalDf_ct.loc[principalDf_ct['date'] <= split_date]
+ct_test = principalDf_ct.loc[principalDf_ct['date'] > split_date]
+
+ca_train = principalDf_ca.loc[principalDf_ca['date'] <= split_date]
+ca_test = principalDf_ca.loc[principalDf_ca['date'] > split_date]
+
+#endregion
+
+
+
+#region Create df for each PC 
+
+#testing, training, and total sets
+
+df1_test = ct_test['date'].copy()
+temp1 = ct_test['principal component 1 - Temp'].copy()
+aod1 = ca_test['principal component 1 - AOD'].copy()
+df1_test = pd.concat([df1_test, temp1], axis = 1)
+df1_test = pd.concat([df1_test, aod1], axis = 1)
+
+df2_test = ct_test['date'].copy()
+temp2 = ct_test[["principal component 2 - Temp"]].copy()
+aod2 = ca_test[["principal component 2 - AOD"]].copy()
+df2_test = pd.concat([df2_test, temp2], axis = 1)
+df2_test = pd.concat([df2_test, aod2], axis = 1)
+
+df3_test = ct_test['date'].copy()
+temp3 = ct_test[["principal component 3 - Temp"]].copy()
+aod3 = ca_test[["principal component 3 - AOD"]].copy()
+df3_test = pd.concat([df3_test, temp3], axis = 1)
+df3_test = pd.concat([df3_test, aod3], axis = 1)
+
+df4_test = ct_test['date'].copy()
+temp4 = ct_test[["principal component 4 - Temp"]] 
+aod4 = ca_test[["principal component 4 - AOD"]].copy()
+df4_test = pd.concat([df4_test, temp4], axis = 1)
+df4_test = pd.concat([df4_test, aod4], axis = 1)
+
+df5_test = ct_test['date'].copy()
+temp5= ct_test[["principal component 5 - Temp"]].copy()
+aod5 = ca_test[["principal component 5 - AOD"]].copy()
+df5_test = pd.concat([df5_test, temp5], axis = 1)
+df5_test = pd.concat([df5_test, aod5], axis = 1)
+
+df6_test = ct_test['date'].copy()
+temp6 = ct_test['principal component 6 - Temp'].copy()
+aod6 = ca_test['principal component 6 - AOD'].copy()
+df6_test = pd.concat([df6_test, temp6], axis = 1)
+df6_test = pd.concat([df6_test, aod6], axis = 1)
+
+df7_test = ct_test['date'].copy()
+temp7 = ct_test[["principal component 7 - Temp"]].copy()
+aod7 = ca_test[["principal component 7 - AOD"]].copy()
+df7_test = pd.concat([df7_test, temp7], axis = 1)
+df7_test = pd.concat([df7_test, aod7], axis = 1)
+
+df8_test = ct_test['date'].copy()
+temp8 = ct_test[["principal component 8 - Temp"]].copy()
+aod8 = ca_test[["principal component 8 - AOD"]].copy()
+df8_test = pd.concat([df8_test, temp8], axis = 1)
+df8_test = pd.concat([df8_test, aod8], axis = 1)
+
+df9_test = ct_test['date'].copy()
+temp9 = ct_test[["principal component 9 - Temp"]] 
+aod9 = ca_test[["principal component 9 - AOD"]].copy()
+df9_test = pd.concat([df9_test, temp9], axis = 1)
+df9_test = pd.concat([df9_test, aod9], axis = 1)
+
+df10_test = ct_test['date'].copy()
+temp10= ct_test[["principal component 10 - Temp"]].copy()
+aod10 = ca_test[["principal component 10 - AOD"]].copy()
+df10_test = pd.concat([df10_test, temp10], axis = 1)
+df10_test = pd.concat([df10_test, aod10], axis = 1)
+
+df1_train = ct_train['date'].copy()
+temp1a = ct_train['principal component 1 - Temp'].copy()
+aod1a = ca_train['principal component 1 - AOD'].copy()
+df1_train = pd.concat([df1_train, temp1a], axis = 1)
+df1_train = pd.concat([df1_train, aod1a], axis = 1)
+
+df2_train = ct_train['date'].copy()
+temp2a = ct_train[["principal component 2 - Temp"]].copy()
+aod2a = ca_train[["principal component 2 - AOD"]].copy()
+df2_train = pd.concat([df2_train, temp2a], axis = 1)
+df2_train = pd.concat([df2_train, aod2a], axis = 1)
+
+df3_train = ct_train['date'].copy()
+temp3a = ct_train[["principal component 3 - Temp"]].copy()
+aod3a = ca_train[["principal component 3 - AOD"]].copy()
+df3_train = pd.concat([df3_train, temp3a], axis = 1)
+df3_train = pd.concat([df3_train, aod3a], axis = 1)
+
+df4_train = ct_train['date'].copy()
+temp4a = ct_train[["principal component 4 - Temp"]].copy()
+aod4a = ca_train[["principal component 4 - AOD"]].copy()
+df4_train = pd.concat([df4_train, temp4a], axis = 1)
+df4_train = pd.concat([df4_train, aod4a], axis = 1)
+
+df5_train = ct_train['date'].copy()
+temp5a = ct_train[["principal component 5 - Temp"]].copy()
+aod5a = ca_train[["principal component 5 - AOD"]].copy()
+df5_train = pd.concat([df5_train, temp5a], axis = 1)
+df5_train = pd.concat([df5_train, aod5a], axis = 1)
+
+df6_train = ct_train['date'].copy()
+temp6a = ct_train['principal component 6 - Temp'].copy()
+aod6a = ca_train['principal component 6 - AOD'].copy()
+df6_train = pd.concat([df6_train, temp6a], axis = 1)
+df6_train = pd.concat([df6_train, aod6a], axis = 1)
+
+df7_train = ct_train['date'].copy()
+temp7a = ct_train[["principal component 7 - Temp"]].copy()
+aod7a = ca_train[["principal component 7 - AOD"]].copy()
+df7_train = pd.concat([df7_train, temp7a], axis = 1)
+df7_train = pd.concat([df7_train, aod7a], axis = 1)
+
+df8_train = ct_train['date'].copy()
+temp8a = ct_train[["principal component 8 - Temp"]].copy()
+aod8a = ca_train[["principal component 8 - AOD"]].copy()
+df8_train = pd.concat([df8_train, temp8a], axis = 1)
+df8_train = pd.concat([df8_train, aod8a], axis = 1)
+
+df9_train = ct_train['date'].copy()
+temp9a = ct_train[["principal component 9 - Temp"]].copy()
+aod9a = ca_train[["principal component 9 - AOD"]].copy()
+df9_train = pd.concat([df9_train, temp9a], axis = 1)
+df9_train = pd.concat([df9_train, aod9a], axis = 1)
+
+df10_train = ct_train['date'].copy()
+temp10a = ct_train[["principal component 10 - Temp"]].copy()
+aod10a = ca_train[["principal component 10 - AOD"]].copy()
+df10_train = pd.concat([df10_train, temp10a], axis = 1)
+df10_train = pd.concat([df10_train, aod10a], axis = 1)
+
+df1_train.rename(columns = {'date':'ds'}, inplace = True)
+df2_train.rename(columns = {'date':'ds'}, inplace = True)
+df3_train.rename(columns = {'date':'ds'}, inplace = True)
+df4_train.rename(columns = {'date':'ds'}, inplace = True)
+df5_train.rename(columns = {'date':'ds'}, inplace = True)
+df6_train.rename(columns = {'date':'ds'}, inplace = True)
+df7_train.rename(columns = {'date':'ds'}, inplace = True)
+df8_train.rename(columns = {'date':'ds'}, inplace = True)
+df9_train.rename(columns = {'date':'ds'}, inplace = True)
+df10_train.rename(columns = {'date':'ds'}, inplace = True)
+
+df1_test.rename(columns = {'date':'ds'}, inplace = True)
+df2_test.rename(columns = {'date':'ds'}, inplace = True)
+df3_test.rename(columns = {'date':'ds'}, inplace = True)
+df4_test.rename(columns = {'date':'ds'}, inplace = True)
+df5_test.rename(columns = {'date':'ds'}, inplace = True)
+df6_test.rename(columns = {'date':'ds'}, inplace = True)
+df7_test.rename(columns = {'date':'ds'}, inplace = True)
+df8_test.rename(columns = {'date':'ds'}, inplace = True)
+df9_test.rename(columns = {'date':'ds'}, inplace = True)
+df10_test.rename(columns = {'date':'ds'}, inplace = True)
+
+df1_train.rename(columns = {'principal component 1 - Temp':'y'}, inplace = True)
+df2_train.rename(columns = {'principal component 2 - Temp':'y'}, inplace = True)
+df3_train.rename(columns = {'principal component 3 - Temp':'y'}, inplace = True)
+df4_train.rename(columns = {'principal component 4 - Temp':'y'}, inplace = True)
+df5_train.rename(columns = {'principal component 5 - Temp':'y'}, inplace = True)
+df6_train.rename(columns = {'principal component 6 - Temp':'y'}, inplace = True)
+df7_train.rename(columns = {'principal component 7 - Temp':'y'}, inplace = True)
+df8_train.rename(columns = {'principal component 8 - Temp':'y'}, inplace = True)
+df9_train.rename(columns = {'principal component 9 - Temp':'y'}, inplace = True)
+df10_train.rename(columns = {'principal component 10 - Temp':'y'}, inplace = True)
+
+df1_test.rename(columns = {'principal component 1 - Temp':'y'}, inplace = True)
+df2_test.rename(columns = {'principal component 2 - Temp':'y'}, inplace = True)
+df3_test.rename(columns = {'principal component 3 - Temp':'y'}, inplace = True)
+df4_test.rename(columns = {'principal component 4 - Temp':'y'}, inplace = True)
+df5_test.rename(columns = {'principal component 5 - Temp':'y'}, inplace = True)
+df6_test.rename(columns = {'principal component 6 - Temp':'y'}, inplace = True)
+df7_test.rename(columns = {'principal component 7 - Temp':'y'}, inplace = True)
+df8_test.rename(columns = {'principal component 8 - Temp':'y'}, inplace = True)
+df9_test.rename(columns = {'principal component 9 - Temp':'y'}, inplace = True)
+df10_test.rename(columns = {'principal component 10 - Temp':'y'}, inplace = True)
+
+df1_train.rename(columns = {'principal component 1 - AOD':'x'}, inplace = True)
+df2_train.rename(columns = {'principal component 2 - AOD':'x'}, inplace = True)
+df3_train.rename(columns = {'principal component 3 - AOD':'x'}, inplace = True)
+df4_train.rename(columns = {'principal component 4 - AOD':'x'}, inplace = True)
+df5_train.rename(columns = {'principal component 5 - AOD':'x'}, inplace = True)
+df6_train.rename(columns = {'principal component 6 - AOD':'x'}, inplace = True)
+df7_train.rename(columns = {'principal component 7 - AOD':'x'}, inplace = True)
+df8_train.rename(columns = {'principal component 8 - AOD':'x'}, inplace = True)
+df9_train.rename(columns = {'principal component 9 - AOD':'x'}, inplace = True)
+df10_train.rename(columns = {'principal component 10 - AOD':'x'}, inplace = True)
+
+df1_test.rename(columns = {'principal component 1 - AOD':'x'}, inplace = True)
+df2_test.rename(columns = {'principal component 2 - AOD':'x'}, inplace = True)
+df3_test.rename(columns = {'principal component 3 - AOD':'x'}, inplace = True)
+df4_test.rename(columns = {'principal component 4 - AOD':'x'}, inplace = True)
+df5_test.rename(columns = {'principal component 5 - AOD':'x'}, inplace = True)
+df6_test.rename(columns = {'principal component 6 - AOD':'x'}, inplace = True)
+df7_test.rename(columns = {'principal component 7 - AOD':'x'}, inplace = True)
+df8_test.rename(columns = {'principal component 8 - AOD':'x'}, inplace = True)
+df9_test.rename(columns = {'principal component 9 - AOD':'x'}, inplace = True)
+df10_test.rename(columns = {'principal component 10 - AOD':'x'}, inplace = True)
+
+
+df1 = df1_train
+df1 = pd.concat([df1, df1_test], axis = 0)
+
+df2 = df2_train
+df2 = pd.concat([df2, df2_test], axis = 0)
+
+df3 = df3_train
+df3 = pd.concat([df3, df3_test], axis = 0)
+
+df4 = df4_train
+df4 = pd.concat([df4, df4_test], axis = 0)
+
+df5 = df5_train
+df5 = pd.concat([df5, df5_test], axis = 0)
+
+df6 = df6_train
+df6 = pd.concat([df6, df6_test], axis = 0)
+
+df7 = df7_train
+df7 = pd.concat([df7, df7_test], axis = 0)
+
+df8 = df8_train
+df8 = pd.concat([df8, df8_test], axis = 0)
+
+df9 = df9_train
+df9 = pd.concat([df9, df9_test], axis = 0)
+
+df10 = df10_train
+df10 = pd.concat([df10, df10_test], axis = 0)
+
+
+#endregion
+
+
+
+# region Neural Prophet
+
+set_log_level("ERROR")
+
+# Model and prediction
+
+#PC1
+
+m1 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m1.set_plotting_backend("matplotlib")
+
+m1.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig1a = df1.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics1 = m1.fit(df1_train, freq = 'D', validation_df = df1_test, progress = None)
+metrics1
+
+test_metrics1 = m1.test(df1_test)
+test_metrics1
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics1["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics1["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC1", fontsize=28)
+
+forecast1 = m1.predict(df1)
+m1.plot(forecast1)
+
+m1.plot_components(forecast1, components=["lagged_regressors"])
+m1.plot_parameters(components=["lagged_regressors"])
+m1.plot_components(forecast1)
+m1.plot_parameters(components=["autoregression"])
+m1.plot_components(forecast1, components=["autoregression"])
+
+df_residuals1 = pd.DataFrame({"ds": df1["ds"], "residuals": df1["y"] - forecast1["yhat1"]})
+fig1 = df_residuals1.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC2
+
+m2 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m2.set_plotting_backend("matplotlib")
+
+m2.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig2a = df2.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics2 = m2.fit(df2_train, freq = 'D', validation_df = df2_test, progress = None)
+metrics2
+
+test_metrics2 = m2.test(df2_test)
+test_metrics2
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics2["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics2["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC2", fontsize=28)
+
+forecast2 = m2.predict(df2)
+m2.plot(forecast2)
+
+m2.plot_components(forecast2, components=["lagged_regressors"])
+m2.plot_parameters(components=["lagged_regressors"])
+m2.plot_components(forecast2)
+m2.plot_parameters(components=["autoregression"])
+m2.plot_components(forecast2, components=["autoregression"])
+
+df_residuals2 = pd.DataFrame({"ds": df2["ds"], "residuals": df2["y"] - forecast2["yhat1"]})
+fig2 = df_residuals2.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC3
+
+m3 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m3.set_plotting_backend("matplotlib")
+
+m3.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig3a = df3.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics3 = m3.fit(df3_train, freq = 'D', validation_df = df3_test, progress = None)
+metrics3
+
+test_metrics3 = m3.test(df3_test)
+test_metrics3
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics3["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics3["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC3", fontsize=28)
+
+forecast3 = m3.predict(df3)
+m3.plot(forecast3)
+
+m3.plot_components(forecast3, components=["lagged_regressors"])
+m3.plot_parameters(components=["lagged_regressors"])
+m3.plot_components(forecast3)
+m3.plot_parameters(components=["autoregression"])
+m3.plot_components(forecast3, components=["autoregression"])
+
+df_residuals3 = pd.DataFrame({"ds": df3["ds"], "residuals": df3["y"] - forecast3["yhat1"]})
+fig3 = df_residuals3.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC4
+
+m4 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m4.set_plotting_backend("matplotlib")
+
+m4.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig4a = df4.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics4 = m4.fit(df4_train, freq = 'D', validation_df = df4_test, progress = None)
+metrics4
+
+test_metrics4 = m4.test(df4_test)
+test_metrics4
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics4["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics4["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC4", fontsize=28)
+
+forecast4 = m4.predict(df4)
+m4.plot(forecast4)
+
+m4.plot_components(forecast4, components=["lagged_regressors"])
+m4.plot_parameters(components=["lagged_regressors"])
+m4.plot_components(forecast4)
+m4.plot_parameters(components=["autoregression"])
+m4.plot_components(forecast4, components=["autoregression"])
+
+df_residuals4 = pd.DataFrame({"ds": df4["ds"], "residuals": df4["y"] - forecast4["yhat1"]})
+fig4 = df_residuals4.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC5
+
+m5 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m5.set_plotting_backend("matplotlib")
+
+m5.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig5a = df5.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics5 = m5.fit(df5_train, freq = 'D', validation_df = df5_test, progress = None)
+metrics5
+
+test_metrics5 = m5.test(df5_test)
+test_metrics5
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics5["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics5["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC5", fontsize=28)
+
+forecast5 = m5.predict(df5)
+m5.plot(forecast5)
+
+m5.plot_components(forecast5, components=["lagged_regressors"])
+m5.plot_parameters(components=["lagged_regressors"])
+m5.plot_components(forecast5)
+m5.plot_parameters(components=["autoregression"])
+m5.plot_components(forecast5, components=["autoregression"])
+
+df_residuals5 = pd.DataFrame({"ds": df5["ds"], "residuals": df5["y"] - forecast5["yhat1"]})
+fig5 = df_residuals5.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC6
+
+m6 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m6.set_plotting_backend("matplotlib")
+
+m6.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig6a = df6.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics6 = m6.fit(df6_train, freq = 'D', validation_df = df6_test, progress = None)
+metrics6
+
+test_metrics6 = m6.test(df6_test)
+test_metrics6
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics6["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics6["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC6", fontsize=28)
+
+forecast6 = m6.predict(df6)
+m6.plot(forecast6)
+m6.plot_components(forecast6, components=["lagged_regressors"])
+m6.plot_parameters(components=["lagged_regressors"])
+m6.plot_components(forecast6)
+m6.plot_parameters(components=["autoregression"])
+m6.plot_components(forecast6, components=["autoregression"])
+
+df_residuals6 = pd.DataFrame({"ds": df6["ds"], "residuals": df6["y"] - forecast6["yhat1"]})
+fig6 = df_residuals6.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC7
+
+m7 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m7.set_plotting_backend("matplotlib")
+
+m7.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig7a = df7.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics7 = m7.fit(df7_train, freq = 'D', validation_df = df7_test, progress = None)
+metrics7
+
+test_metrics7 = m7.test(df7_test)
+test_metrics7
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics7["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics7["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC7", fontsize=28)
+
+forecast7 = m7.predict(df7)
+m7.plot(forecast7)
+
+m7.plot_components(forecast7, components=["lagged_regressors"])
+m7.plot_parameters(components=["lagged_regressors"])
+m7.plot_components(forecast7)
+m7.plot_parameters(components=["autoregression"])
+m7.plot_components(forecast7, components=["autoregression"])
+
+df_residuals7 = pd.DataFrame({"ds": df7["ds"], "residuals": df7["y"] - forecast7["yhat1"]})
+fig7 = df_residuals7.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC8
+
+m8 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m8.set_plotting_backend("matplotlib")
+
+m8.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig8a = df8.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics8 = m8.fit(df8_train, freq = 'D', validation_df = df8_test, progress = None)
+metrics8
+
+test_metrics8 = m8.test(df8_test)
+test_metrics8
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics8["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics8["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC8", fontsize=28)
+
+forecast8 = m8.predict(df8)
+m8.plot(forecast8)
+
+m8.plot_components(forecast8, components=["lagged_regressors"])
+m8.plot_parameters(components=["lagged_regressors"])
+m8.plot_components(forecast8)
+m8.plot_parameters(components=["autoregression"])
+m8.plot_components(forecast8, components=["autoregression"])
+
+df_residuals8 = pd.DataFrame({"ds": df8["ds"], "residuals": df8["y"] - forecast8["yhat1"]})
+fig8 = df_residuals8.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC9
+
+m9 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m9.set_plotting_backend("matplotlib")
+
+m9.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig9a = df9.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics9 = m9.fit(df9_train, freq = 'D', validation_df = df9_test, progress = None)
+metrics9
+
+test_metrics9 = m9.test(df9_test)
+test_metrics9
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics9["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics9["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC9", fontsize=28)
+
+forecast9 = m9.predict(df9)
+m9.plot(forecast9)
+
+m9.plot_components(forecast9, components=["lagged_regressors"])
+m9.plot_parameters(components=["lagged_regressors"])
+m9.plot_components(forecast9)
+m9.plot_parameters(components=["autoregression"])
+m9.plot_components(forecast9, components=["autoregression"])
+
+df_residuals9 = pd.DataFrame({"ds": df9["ds"], "residuals": df9["y"] - forecast9["yhat1"]})
+fig9 = df_residuals9.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#PC10
+
+m10 = NeuralProphet(
+    growth = 'off',
+    n_lags= 4,
+    learning_rate=0.01,
+    yearly_seasonality=False,
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+m10.set_plotting_backend("matplotlib")
+
+m10.add_lagged_regressor('x')
+
+#metrics and plots
+
+fig10a = df10.plot(x="ds", y=["y", "x"], figsize=(10, 6))
+
+metrics10 = m10.fit(df10_train, freq = 'D', validation_df = df10_test, progress = None)
+metrics10
+
+test_metrics10 = m10.test(df10_test)
+test_metrics10
+
+fig, ax = plt.subplots(figsize=(20, 8))
+ax.plot(metrics10["MAE"], '-o', label="Training Loss")  
+ax.plot(metrics10["MAE_val"], '-r', label="Validation Loss")
+ax.legend(loc='center right', fontsize=16)
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.set_xlabel("Epoch", fontsize=28)
+ax.set_ylabel("Loss", fontsize=28)
+ax.set_title("Model Loss (MAE) - PC10", fontsize=28)
+
+forecast10 = m10.predict(df10)
+m10.plot(forecast10)
+
+m10.plot_components(forecast10, components=["lagged_regressors"])
+m10.plot_parameters(components=["lagged_regressors"])
+m10.plot_components(forecast10)
+m10.plot_parameters(components=["autoregression"])
+m10.plot_components(forecast10, components=["autoregression"])
+
+df_residuals10 = pd.DataFrame({"ds": df10["ds"], "residuals": df10["y"] - forecast10["yhat1"]})
+fig10 = df_residuals10.plot(x="ds", y="residuals", figsize=(10, 6))
+
+#endregion
+
+
+
+# region Backscale
+
+#make new dataframe with predicted values (values after split date)
+
+yhat1 = forecast1.loc[forecast1['ds'] > split_date]
+df1_predict = df1_train['y'].copy()
+yhat1 = yhat1['yhat1'].copy()
+df1_predict = pd.concat([df1_predict, yhat1], axis = 0)
+
+yhat2 = forecast2.loc[forecast2['ds'] > split_date]
+df2_predict = df2_train['y'].copy()
+yhat2 = yhat2['yhat1'].copy()
+df2_predict = pd.concat([df2_predict, yhat2], axis = 0)
+
+yhat3 = forecast3.loc[forecast3['ds'] > split_date]
+df3_predict = df3_train['y'].copy()
+yhat3 = yhat3['yhat1'].copy()
+df3_predict = pd.concat([df3_predict, yhat3], axis = 0) 
+
+yhat4 = forecast4.loc[forecast4['ds'] > split_date]
+df4_predict = df4_train['y'].copy()
+yhat4 = yhat4['yhat1'].copy()
+df4_predict = pd.concat([df4_predict, yhat4], axis = 0)
+
+yhat5 = forecast5.loc[forecast5['ds'] > split_date]
+df5_predict = df5_train['y'].copy()
+yhat5 = yhat5['yhat1'].copy()
+df5_predict = pd.concat([df5_predict, yhat5], axis = 0)
+
+yhat6 = forecast6.loc[forecast6['ds'] > split_date]
+df6_predict = df6_train['y'].copy()
+yhat6 = yhat6['yhat1'].copy()
+df6_predict = pd.concat([df6_predict, yhat6], axis = 0)
+
+yhat7 = forecast7.loc[forecast7['ds'] > split_date]
+df7_predict = df7_train['y'].copy()
+yhat7 = yhat7['yhat1'].copy()
+df7_predict = pd.concat([df7_predict, yhat7], axis = 0)
+
+yhat8 = forecast8.loc[forecast8['ds'] > split_date]
+df8_predict = df8_train['y'].copy()
+yhat8 = yhat8['yhat1'].copy()
+df8_predict = pd.concat([df8_predict, yhat8], axis = 0)
+
+yhat9 = forecast9.loc[forecast9['ds'] > split_date]
+df9_predict = df9_train['y'].copy()
+yhat9 = yhat9['yhat1'].copy()
+df9_predict = pd.concat([df9_predict, yhat9], axis = 0)
+
+yhat10 = forecast10.loc[forecast10['ds'] > split_date]
+df10_predict = df10_train['y'].copy()
+yhat10 = yhat10['yhat1'].copy()
+df10_predict = pd.concat([df10_predict, yhat10], axis = 0)
+
+#combine all predicted dataframes for each PC
+
+df_predict = pd.concat([df1_predict, df2_predict, df3_predict, df4_predict, df5_predict, df6_predict, df7_predict, df8_predict, df9_predict, df10_predict], axis = 1)
+
+#recomp with inverse transform
+
+ct_orig = np.dot(df_predict,pca.components_)
+ct_orig_backscaled = scaler_ct.inverse_transform(ct_orig)
+
+ct_orig = pd.DataFrame(ct_orig)
+ct_orig_backscaled = pd.DataFrame(ct_orig_backscaled)
+
+ct_orig_backscaled['date'] = pd.date_range(start='1/1/1986', periods = len(principalDf_ct), freq='D')
+
+ct_orig_backscaled = ct_orig_backscaled.set_index('date')
+ct_orig_backscaled.columns = clm_t.columns
+
+df_ca = principalDf_ca
+df_ca = df_ca.drop(['date'], axis = 1)
+
+ca_orig = np.dot(df_ca,pca.components_)
+ca_orig_backscaled = scaler_ca.inverse_transform(ca_orig)
+
+ca_orig = pd.DataFrame(ca_orig)
+ca_orig_backscaled = pd.DataFrame(ca_orig_backscaled)
+
+ca_orig_backscaled['date'] = pd.date_range(start='1/1/1986', periods = len(principalDf_ca), freq='D')
+
+ca_orig_backscaled = ca_orig_backscaled.set_index('date')
+ca_orig_backscaled.columns = clm_a.columns
+
+#non-predicted values back-scaled
+
+df_ct = principalDf_ct
+df_ct = df_ct.drop(['date'], axis = 1)
+
+ct_np = np.dot(df_ct,pca.components_)
+ct_np_backscaled = scaler_ct.inverse_transform(ct_np)
+
+ct_np = pd.DataFrame(ct_np)
+ct_np_backscaled = pd.DataFrame(ct_np_backscaled)
+
+ct_np_backscaled['date'] = pd.date_range(start='1/1/1986', periods = len(principalDf_ca), freq='D')
+
+ct_np_backscaled = ct_np_backscaled.set_index('date')
+ct_np_backscaled.columns = clm_t.columns
+
+#export to R for data processing
+
+filepath5 = Path('/Users/rachelalaynahall/Desktop/ct_bs10.csv')  
+filepath5.parent.mkdir(parents=True, exist_ok=True)  
+ct_orig_backscaled.to_csv(filepath5)
+
+filepath6 = Path('/Users/rachelalaynahall/Desktop/ca_bs10.csv')  
+filepath6.parent.mkdir(parents=True, exist_ok=True)  
+ca_orig_backscaled.to_csv(filepath6)
+
+filepath7 = Path('/Users/rachelalaynahall/Desktop/ct_np10.csv')  
+filepath7.parent.mkdir(parents=True, exist_ok=True)  
+ct_np_backscaled.to_csv(filepath7)
+
+### R CODE BLOCK ###
+
+
+```{r}
+ct_bs10 = read.csv("~/Desktop/ct_bs10.csv")
+
+```
+
+
+```{r}
+rownames(ct_bs10)<-unlist(ct_bs10[,1])
+ct_bs10 = ct_bs10[-c(1)]
+
+ct_bs10 = ct_bs10 %>% rownames_to_column('row') %>% pivot_longer(cols = -row)
+
+ct_bs10 = ct_bs10 %>% 
+  rename(
+    date = row,
+    location = name,
+    T = value
+    )
+```
+
+
+
+
+
+```{r}
+write.csv(ct_bs10, "~/Desktop/10ct_bs.csv", row.names = FALSE)
+```
+
+
+
+```{r}
+ca_bs10 = read.csv("~/Desktop/ca_bs10.csv")
+
+```
+
+
+```{r}
+rownames(ca_bs10)<-unlist(ca_bs10[,1])
+ca_bs10 = ca_bs10[-c(1)]
+
+ca_bs10 = ca_bs10 %>% rownames_to_column('row') %>% pivot_longer(cols = -row)
+
+ca_bs10 = ca_bs10 %>% 
+  rename(
+    date = row,
+    location = name,
+    A = value
+    )
+```
+
+
+```{r}
+write.csv(ca_bs10, "~/Desktop/10ca_bs.csv", row.names = FALSE)
+```
+
+
+```{r}
+ct_np10 = read.csv("~/Desktop/ct_np10.csv")
+
+```
+
+
+```{r}
+rownames(ct_np10)<-unlist(ct_np10[,1])
+ct_np10 = ct_np10[-c(1)]
+
+ct_np10 = ct_np10 %>% rownames_to_column('row') %>% pivot_longer(cols = -row)
+
+ct_np10 = ct_np10 %>% 
+  rename(
+    date = row,
+    location = name,
+    T = value
+    )
+```
+
+
+```{r}
+write.csv(ct_np10, "~/Desktop/10ct_np.csv", row.names = FALSE)
+```
+
+### END R CODE BLOCK
+
+
+#import from R
+
+#temperature
+
+ct_bs = pd.read_csv('/Users/rachelalaynahall/Desktop/10ct_bs.csv')
+
+#split location back into latitude and longitude by separator ".."
+
+ct_bs[['lat', 'lon']] = ct_bs["location"].apply(lambda x: pd.Series(str(x).split("..")))
+
+#subtract 90 and 180 from latitude and longitude respectively to get actual locations back
+
+ct_bs['lat'] = ct_bs['lat'].str.replace('X', '')
+ct_bs["lat"] = ct_bs["lat"].astype(float)
+ct_bs["lon"] = ct_bs["lon"].astype(float)
+ct_bs["lat"] = ct_bs["lat"] - 90
+ct_bs["lon"] = ct_bs["lon"] - 180
+ct_bs = ct_bs.drop(['location'], axis = 1)
+ct_bs['date'] = pd.to_datetime(ct_bs['date'])
+ct_bs.rename(columns = {'date':'time'}, inplace = True)
+
+#add climatologies back in
+
+ct_bs_array = ct_bs.set_index(["time", "lat", "lon"]).to_xarray()
+dtb_month = ct_bs_array.groupby('time.month') + ct_month
+
+tf = dtb_month.to_dataframe()
+tf = tf.drop(['month'], axis = 1)
+
+#make dataframe to compare recomped and predicted values to
+
+compare = dt.to_dataframe()
+
+#import from R
+
+#AOD
+
+ca_bs = pd.read_csv('/Users/rachelalaynahall/Desktop/10ca_bs.csv')
+
+#split location back into latitude and longitude by separator ".."
+
+ca_bs[['lat', 'lon']] = ca_bs["location"].apply(lambda x: pd.Series(str(x).split("..")))
+
+ca_bs['lat'] = ca_bs['lat'].str.replace('X', '')
+ca_bs["lat"] = ca_bs["lat"].astype(float)
+ca_bs["lon"] = ca_bs["lon"].astype(float)
+
+
+#subtract 90 and 180 from latitude and longitude respectively to get actual locations back
+
+ca_bs["lat"] = ca_bs["lat"] - 90
+ca_bs["lon"] = ca_bs["lon"] - 180
+ca_bs = ca_bs.drop(['location'], axis = 1)
+ca_bs['date'] = pd.to_datetime(ca_bs['date'])
+ca_bs.rename(columns = {'date':'time'}, inplace = True)
+
+#add climatologies back in
+
+ca_bs_array = ca_bs.set_index(["time", "lat", "lon"]).to_xarray()
+dab_month = ca_bs_array.groupby('time.month') + ca_month
+
+af = dab_month.to_dataframe()
+af = af.drop(['month'], axis = 1)
+
+#make dataframe to compare recomped and predicted values to
+
+compare_a = da.to_dataframe()
+
+#import from R
+
+# non-predicted temperature
+
+ct_np = pd.read_csv('/Users/rachelalaynahall/Desktop/10ct_np.csv')
+
+#split location back into latitude and longitude by separator ".."
+
+ct_np[['lat', 'lon']] = ct_np["location"].apply(lambda x: pd.Series(str(x).split("..")))
+
+ct_np['lat'] = ct_np['lat'].str.replace('X', '')
+ct_np["lat"] = ct_np["lat"].astype(float)
+ct_np["lon"] = ct_np["lon"].astype(float)
+
+#subtract 90 and 180 from latitude and longitude respectively to get actual locations back
+
+ct_np["lat"] = ct_np["lat"] - 90
+ct_np["lon"] = ct_np["lon"] - 180
+ct_np = ct_np.drop(['location'], axis = 1)
+ct_np['date'] = pd.to_datetime(ct_np['date'])
+ct_np.rename(columns = {'date':'time'}, inplace = True)
+
+#add climatologies back in
+
+ct_np_array = ct_np.set_index(["time", "lat", "lon"]).to_xarray()
+dtn_month = ct_np_array.groupby('time.month') + ct_month
+
+tn = dtn_month.to_dataframe()
+tn = tn.drop(['month'], axis = 1)
+
+#make dataframe to compare recomped and predicted values to
+
+compare_t = da.to_dataframe()
+
+#export to R for data processing
+
+filepath8 = Path('/Users/rachelalaynahall/Desktop/tf10.csv')  
+filepath8.parent.mkdir(parents=True, exist_ok=True)  
+tf.to_csv(filepath8)
+
+filepath9 = Path('/Users/rachelalaynahall/Desktop/compare10.csv')  
+filepath9.parent.mkdir(parents=True, exist_ok=True)  
+compare.to_csv(filepath9)
+
+filepath10 = Path('/Users/rachelalaynahall/Desktop/af10.csv')  
+filepath10.parent.mkdir(parents=True, exist_ok=True)  
+af.to_csv(filepath10)
+
+filepath11 = Path('/Users/rachelalaynahall/Desktop/compare_a10.csv')  
+filepath11.parent.mkdir(parents=True, exist_ok=True)  
+compare_a.to_csv(filepath11)
+
+filepath12 = Path('/Users/rachelalaynahall/Desktop/tn10.csv')  
+filepath12.parent.mkdir(parents=True, exist_ok=True)  
+tn.to_csv(filepath12)
+
+filepath13 = Path('/Users/rachelalaynahall/Desktop/compare_t10.csv')  
+filepath13.parent.mkdir(parents=True, exist_ok=True)  
+compare_t.to_csv(filepath13)
+
+#endregion
+
+
+### R CODE BLOCK ###
+
+
+```{r}
+tf10 = read.csv("~/Desktop/tf10.csv")
+compare10 = read.csv("~/Desktop/compare10.csv")
+
+difference10 = tf10['time']
+difference10['lat'] = tf10['lat']
+difference10['lon'] = tf10['lon']
+difference10['diff'] = compare10['T'] - tf10['T']
+
+difference10$location = str_c(difference10$lat, ', ', difference10$lon)
+
+difference10['diff2'] = difference10['diff']^2
+
+af10 = read.csv("~/Desktop/af10.csv")
+compare_a10 = read.csv("~/Desktop/compare_a10.csv")
+
+difference_a10 = af10['time']
+difference_a10['lat'] = af10['lat']
+difference_a10['lon'] = af10['lon']
+difference_a10['diff'] = compare_a10['A'] - af10['A']
+
+difference_a10$location = str_c(difference_a10$lat, ', ', difference_a10$lon)
+
+difference_a10['diff2'] = difference_a10['diff']^2
+
+tn10 = read.csv("~/Desktop/tn10.csv")
+
+difference_t10 = tn10['time']
+difference_t10['lat'] = tn10['lat']
+difference_t10['lon'] = tn10['lon']
+difference_t10['diff'] = compare10['T'] - tn10['T']
+
+difference_t10$location = str_c(difference_t10$lat, ', ', difference_t10$lon)
+
+difference_t10['diff2'] = difference_t10['diff']^2
+
+```
+
+
+```{r}
+write.csv(difference10, "~/Desktop/10difference.csv", row.names = FALSE)
+
+write.csv(difference_a10, "~/Desktop/10difference_a.csv", row.names = FALSE)
+
+write.csv(difference_t10, "~/Desktop/10difference_t.csv", row.names = FALSE)
+```
+
+
+```{r}
+diff_loc10 = difference10 %>%
+  group_by(lat,lon) %>%
+  summarise(mean_diff = mean(diff))
+
+min_10 = min(diff_loc10$mean_diff)
+min_10
+
+max_10 = max(diff_loc10$mean_diff)
+max_10
+
+range_10 = max_10 - min_10
+range_10
+
+mean_loc10 = mean(diff_loc10$mean_diff)
+mean_loc10
+
+
+diff_loc10$mean_diff = diff_loc10$mean_diff^2
+diff_loc10$mean_diff = rescale(diff_loc10$mean_diff, to = c(0, 10))
+
+ggplot(diff_loc10, aes(x = lon, y = lat)) +
+  geom_tile(aes(fill = mean_diff), colour = "white") +
+  scale_fill_gradient(low = "white", high = "black") +
+  theme_minimal() + 
+  ggtitle("Temperature Mean Diff^2 by Location (10 PCs, Predicted Data)")
+
+diff_loc_a10 = difference_a10 %>%
+  group_by(lat,lon) %>%
+  summarise(mean_diff = mean(diff))
+
+min_a10 = min(diff_loc_a10$mean_diff)
+min_a10
+
+max_a10 = max(diff_loc_a10$mean_diff)
+max_a10
+
+diff_loc_a10$mean_diff = diff_loc_a10$mean_diff^2
+diff_loc_a10$mean_diff = rescale(diff_loc_a10$mean_diff, to = c(0, 10))
+
+ggplot(diff_loc_a10, aes(x = lon, y = lat)) +
+  geom_tile(aes(fill = mean_diff), colour = "white") +
+  scale_fill_gradient(low = "white", high = "black") +
+  theme_minimal() + 
+  ggtitle("AOD Mean Diff^2 by Location (10 PCs)")
+
+diff_loc_t10 = difference_t10 %>%
+  group_by(lat,lon) %>%
+  summarise(mean_diff = mean(diff))
+
+min_t10 = min(diff_loc_t10$mean_diff)
+min_t10
+
+max_t10 = max(diff_loc_t10$mean_diff)
+max_t10
+
+diff_loc_t10$mean_diff = diff_loc_t10$mean_diff^2
+diff_loc_t10$mean_diff = rescale(diff_loc_t10$mean_diff, to = c(0, 10))
+
+ggplot(diff_loc_t10, aes(x = lon, y = lat)) +
+  geom_tile(aes(fill = mean_diff), colour = "white") +
+  scale_fill_gradient(low = "white", high = "black") +
+  theme_minimal() + 
+  ggtitle("Temperature Mean Diff^2 by Location (10 PCs)")
+```
+
+
+```{r}
+ggplot(data=difference10 %>% mutate(time=as_date(time)) %>% group_by(time) %>% summarize(m=mean(diff^2)),aes(x=time,y=m)) + geom_line() + 
+  ggtitle("Temperature Mean Diff^2 by Time (10 PCs, Predicted Data)")
+
+ggplot(data=difference_a10 %>% mutate(time=as_date(time)) %>% group_by(time) %>% summarize(m=mean(diff^2)),aes(x=time,y=m)) + geom_line() + 
+  ggtitle("AOD Mean Diff^2 by Time (10 PCs)")
+
+ggplot(data=difference_t10 %>% mutate(time=as_date(time)) %>% group_by(time) %>% summarize(m=mean(diff^2)),aes(x=time,y=m)) + geom_line() + 
+  ggtitle("Temperature Mean Diff^2 by Time (10 PCs)")
+
+diff_time10 = difference10 %>%
+  group_by(time) %>%
+  summarise(mean_diff = mean(diff))
+
+min_time10 = min(diff_time10$mean_diff)
+min_time10
+
+max_time10 = max(diff_time10$mean_diff)
+max_time10
+
+range_time10 = max_time10 - min_time10
+range_time10
+
+mean_time10 = mean(diff_time10$mean_diff)
+mean_time10
+
+diff_timet10 = difference_t10 %>%
+  group_by(time) %>%
+  summarise(mean_diff = mean(diff))
+
+min_timet10 = min(diff_timet10$mean_diff)
+min_timet10
+
+max_timet10 = max(diff_timet10$mean_diff)
+max_timet10
+
+range_timet10 = max_timet10 - min_timet10
+range_timet10
+
+```
+
+
+### END R CODE BLOCK ###
+
+
+#region Plots
+
+temperature = dtb_month['T']
+anomaly = ct_bs_array['T']
+aod = dab_month['A']
+aod_anomaly = ca_bs_array['A']
+
+#interactive plots
+
+dtb_month.hvplot(groupby = 'time', cmap = "viridis")
+ct_bs_array.hvplot(groupby = 'time', cmap = "fire")
+
+dtb_month.hvplot(
+    groupby="time",  # adds a widget for time
+    clim=(210, 274),  # sets colormap limits
+    widget_type="scrubber",
+    widget_location="bottom", 
+    cmap = "coolwarm"
+)
+
+ct_bs_array.hvplot(
+    groupby="time",  # adds a widget for time
+    clim=(-15, 15),  # sets colormap limits
+    widget_type="scrubber",
+    widget_location="bottom",
+    cmap = "seismic"
+)
+
+dab_month.hvplot(
+    groupby="time",  # adds a widget for time
+    clim=(-0.0485,0.3203),  # sets colormap limits
+    widget_type="scrubber",
+    widget_location="bottom", 
+    cmap = "PRGn"
+)
+
+ca_bs_array.hvplot(
+    groupby="time",  # adds a widget for time
+    clim=(-0.1, .4),  # sets colormap limits
+    widget_type="scrubber",
+    widget_location="bottom",
+    cmap = "BuPu"
+)
+
+#print png for each day
+
+nbr = 4727
+
+for j in range(nbr):
+    cbar_kwargs = {
+        'orientation':'horizontal',
+        'fraction': 0.045,
+        'pad': 0.01,
+        'extend':'neither'
+    }
+
+    fig = plt.figure(figsize=(20,20))
+    ax = fig.add_subplot(1,1,1, projection = ccrs.PlateCarree())
+    ax.add_feature(NaturalEarthFeature('cultural', 'admin_0_countries', '10m'),
+                        facecolor='none', edgecolor='black')
+    ax.set_extent([-150, 150, -55, 85])
+
+    date =  pd.to_datetime(anomaly.isel(time=j )['time'].values)
+    ax.set_title("Temperature Anomalies on " + str(date.month) + "/" + str(date.day) + "/" + str(date.year))
+    anomaly.isel(time=j ).plot.imshow(ax=ax, add_labels=False, add_colorbar=True,
+                vmin=-5, vmax=5, cmap='coolwarm',
+                cbar_kwargs=cbar_kwargs, interpolation='bicubic')
+    plt.savefig("3_global_map" + str(j ) + ".png", bbox_inches='tight', dpi=150)
+
+for j  in range(nbr):
+    cbar_kwargs = {
+        'orientation':'horizontal',
+        'fraction': 0.045,
+        'pad': 0.01,
+        'extend':'neither'
+    }
+
+    fig = plt.figure(figsize=(20,20))
+    ax = fig.add_subplot(1,1,1, projection = ccrs.PlateCarree())
+    ax.add_feature(NaturalEarthFeature('cultural', 'admin_0_countries', '10m'),
+                        facecolor='none', edgecolor='black')
+    ax.set_extent([-150, 150, -55, 85])
+
+    date =  pd.to_datetime(temperature.isel(time=j )['time'].values)
+    ax.set_title("Temperature on " + str(date.month) + "/" + str(date.day) + "/" + str(date.year))
+    temperature.isel(time=j ).plot.imshow(ax=ax, add_labels=False, add_colorbar=True,
+                vmin=241.5, vmax=263.5, cmap='coolwarm',
+                cbar_kwargs=cbar_kwargs, interpolation='bicubic')
+    plt.savefig("3_temp_global_map" + str(j ) + ".png", bbox_inches='tight', dpi=150)
+
+for j  in range(nbr):
+    cbar_kwargs = {
+        'orientation':'horizontal',
+        'fraction': 0.045,
+        'pad': 0.01,
+        'extend':'neither'
+    }
+
+    fig = plt.figure(figsize=(20,20))
+    ax = fig.add_subplot(1,1,1, projection = ccrs.PlateCarree())
+    ax.add_feature(NaturalEarthFeature('cultural', 'admin_0_countries', '10m'),
+                        facecolor='none', edgecolor='black')
+    ax.set_extent([-150, 150, -55, 85])
+
+    date =  pd.to_datetime(aod_anomaly.isel(time=j )['time'].values)
+    ax.set_title("AOD Anomalies on " + str(date.month) + "/" + str(date.day) + "/" + str(date.year))
+    aod_anomaly.isel(time=j ).plot.imshow(ax=ax, add_labels=False, add_colorbar=True,
+                vmin=-0.1, vmax=0.2, 
+                cmap='BuPu',
+                cbar_kwargs=cbar_kwargs, interpolation='bicubic')
+    plt.savefig("3_anom_aod_global_map" + str(j ) + ".png", bbox_inches='tight', dpi=150)
+
+for j  in range(nbr):
+    cbar_kwargs = {
+        'orientation':'horizontal',
+        'fraction': 0.045,
+        'pad': 0.01,
+        'extend':'neither'
+    }
+
+    fig = plt.figure(figsize=(20,20))
+    ax = fig.add_subplot(1,1,1, projection = ccrs.PlateCarree())
+    ax.add_feature(NaturalEarthFeature('cultural', 'admin_0_countries', '10m'),
+                        facecolor='none', edgecolor='black')
+    ax.set_extent([-150, 150, -55, 85])
+
+    date =  pd.to_datetime(aod.isel(time=j )['time'].values)
+    ax.set_title("AOD on " + str(date.month) + "/" + str(date.day) + "/" + str(date.year))
+    aod.isel(time=j ).plot.imshow(ax=ax, add_labels=False, add_colorbar=True,
+                vmin=-0.1, vmax=0.4, cmap='BuPu',
+                cbar_kwargs=cbar_kwargs, interpolation='bicubic')
+    plt.savefig("3_aod_global_map" + str(j ) + ".png", bbox_inches='tight', dpi=150)
+
+
+
+
+#endregion
